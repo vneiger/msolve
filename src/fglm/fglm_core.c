@@ -39,7 +39,7 @@ double omp_get_wtime(void) { return realtime();}
 #define MIN(x, y) ((x) > (y) ? (y) : (x))
 
 #define DEBUGFGLM 0
-#define BLOCKWIED 0
+#define BLOCKWIED 1
 
 #include <flint/nmod_poly.h>
 
@@ -678,7 +678,7 @@ static void generate_matrix_sequence(sp_matfglm_t *matxn, fglm_data_t * data,
   const szmat_t ncols = matxn->ncols;
   const szmat_t nrows = matxn->nrows;
 
-  const int BL = 16;
+  const int BL = 64; // FIXME was 16; allow larger BL (32, ... constraints?)
   /* allocates random matrix */
   CF_t *Rmat ALIGNED32;
   if(posix_memalign((void **)&Rmat, 32, BL*ncols*sizeof(CF_t))){
@@ -710,14 +710,15 @@ static void generate_matrix_sequence(sp_matfglm_t *matxn, fglm_data_t * data,
   }
   memset(tres, 0, nrows*ncols*sizeof(CF_t));
 
-  szmat_t nb = 2 * matxn->ncols / BL;
+  szmat_t nb = 2 * matxn->ncols / BL; // FIXME + 1 if does not divide?
   for(szmat_t i = 0; i < nb; i++){
-    sparse_matfglm_mul(res, matxn, Rmat,
+    sparse_matfglm_mul(res, matxn, Rmat, // FIXME relancer sur Rmat = res
                        tres,
                        BL,
                        prime, preinv,
                        RED_32,
                        RED_64);
+    // FIXME recuperer le morceau de res (16x16 top submat)
   }
   free(Rmat);
   free(res);
@@ -1550,6 +1551,8 @@ param_t *nmod_fglm_compute(sp_matfglm_t *matrix, const mod_t prime, const nvars_
     nmod_mat_entry(matp->coeffs + 0, gdim+i, i) = prime-1;
 
   // convert to poly_mat pmat, and forget matp
+  fprintf(stderr, "Computing matrix generator...");
+  fflush(stderr);
   double st_recon = omp_get_wtime();
   nmod_poly_mat_t pmat;
   nmod_poly_mat_set_from_mat_poly(pmat, matp);
@@ -1568,8 +1571,7 @@ param_t *nmod_fglm_compute(sp_matfglm_t *matrix, const mod_t prime, const nvars_
   nmod_poly_mat_clear(appbas);
 
   double tt_recon = omp_get_wtime() - st_recon;
-  fprintf(stderr, "Matrix generator computed\n");
-  fprintf(stderr, "Elapsed time : %.2f\n", tt_recon);
+  fprintf(stderr, " done --> %.2f\n", tt_recon);
   fprintf(stderr, "Implementation to be completed\n");
 
   exit(1);
@@ -1705,14 +1707,75 @@ param_t *nmod_fglm_compute_trace_data(sp_matfglm_t *matrix, mod_t prime,
   double st_fglm = realtime();
 
 #if BLOCKWIED > 0
-  fprintf(stderr, "Starts computation of matrix sequence\n");
+  // START COMPARE code to be removed eventually
+  fprintf(stderr, "Computation of scalar sequence...");
+  fflush(stderr);
   double st0 = omp_get_wtime();
+  generate_sequence_verif(matrix, *bdata, block_size, dimquot,
+                          squvars, linvars, nvars, prime, st);
+  double et0 = omp_get_wtime() - st0;
+  fprintf(stderr, " done --> %.2f\n", et0);
+  // END COMPARE
+
+  fprintf(stderr, "Computation of matrix sequence...");
+  fflush(stderr);
+  st0 = omp_get_wtime();
   generate_matrix_sequence(matrix, *bdata, block_size, dimquot,
                            squvars, linvars, nvars, prime, st);
-  double et0 = omp_get_wtime() - st0;
-  fprintf(stderr, "Matrix sequence computed\n");
-  fprintf(stderr, "Elapsed time : %.2f\n", et0);
+  et0 = omp_get_wtime() - st0;
+  fprintf(stderr, " done --> %.2f\n", et0);
+
+  // pick some nbrows, nbcols, length
+  // (matrix sequence has "2*glen" matrices of size "gdim x gdim"
+  slong gdim = 64;
+  slong glen = dimquot/gdim;
+  nmod_mat_poly_t matp;
+  nmod_mat_poly_init2(matp, 2*gdim, gdim, prime, 2*glen);
+  _nmod_mat_poly_set_length(matp, 2*glen);
+  // top gdim x gdim submatrix matrices is formed from the matrix sequence
+  // for the moment, let's take random coefficients
+  flint_rand_t state;
+  flint_randinit(state);
+  srand(time(0));
+  flint_randseed(state, rand(), rand()+87);
+  for (slong k = 0; k < 2*glen; k++)
+  {
+    mp_ptr vec = (matp->coeffs + k)->entries;
+    for (slong i = 0; i < gdim*gdim; i++)
+      vec[i] = n_randint(state, matp->mod.n);
+  }
+  // bottom gdim x gdim submatrix is -identity
+  for (slong i = 0; i < gdim; i++)
+    nmod_mat_entry(matp->coeffs + 0, gdim+i, i) = prime-1;
+
+  // convert to poly_mat pmat, and forget matp
+  double st_recon = omp_get_wtime();
+  nmod_poly_mat_t pmat;
+  nmod_poly_mat_init(pmat, 2*gdim, gdim, prime);
+  nmod_poly_mat_set_from_mat_poly(pmat, matp);
+  nmod_mat_poly_clear(matp);
+
+  // fraction reconstruction
+  nmod_poly_mat_t appbas;
+  nmod_poly_mat_init(appbas, 2*gdim, 2*gdim, prime);
+  slong * shift = malloc(2*gdim * sizeof(slong));
+  nmod_poly_mat_pmbasis(appbas, shift, pmat, 2*glen);
+  // extract generator and forget appbas
+  nmod_poly_mat_t gen;
+  nmod_poly_mat_init(gen, gdim, gdim, prime);
+  for (slong i = 0; i < gdim; i++)
+    for (slong j = 0; j < gdim; j++)
+      nmod_poly_swap(gen->rows[i] + j, appbas->rows[i] + j);
+  nmod_poly_mat_clear(appbas);
+
+  // FIXME check clear everyone
+  free(shift);
+
+  double tt_recon = omp_get_wtime() - st_recon;
+  fprintf(stderr, "Matrix generator computed\n");
+  fprintf(stderr, "Elapsed time : %.2f\n", tt_recon);
   fprintf(stderr, "Implementation to be completed\n");
+
   exit(1);
 #else
   generate_sequence_verif(matrix, *bdata, block_size, dimquot,
